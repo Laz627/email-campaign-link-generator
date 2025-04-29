@@ -74,22 +74,31 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def combine_fields(row: pd.Series, enrich: bool = True) -> str:
-    """Create the text we send to the embedding model."""
-    parts: List[str] = [row["URL"], row["Title"], row["Meta Description"]]
+    """Create the text we send to the embedding model.
+    Cast every element to *str* to avoid TypeErrors when NaN / floats appear.
+    """
+    parts: List[str] = [str(row["URL"]), str(row["Title"]), str(row["Meta Description"])]
+
     if enrich:
-        # optional query weighting proportional to click counts
         total_clicks = (
-            row.get("Query #1 Clicks", 0) + row.get("Query #2 Clicks", 0) + row.get("Query #3 Clicks", 0)
+            row.get("Query #1 Clicks", 0)
+            + row.get("Query #2 Clicks", 0)
+            + row.get("Query #3 Clicks", 0)
         ) or 1
+
         for q, c in [
             (row.get("Query #1", ""), row.get("Query #1 Clicks", 0)),
             (row.get("Query #2", ""), row.get("Query #2 Clicks", 0)),
             (row.get("Query #3", ""), row.get("Query #3 Clicks", 0)),
         ]:
+            q = "" if (pd.isna(q) or not q) else str(q)
             if q:
                 repeats = 1 + round(2 * c / total_clicks)  # 1–3 repeats
                 parts.extend([q] * repeats)
-    return " | ".join([p for p in parts if p])
+
+    # keep only non-empty strings, ensure every element is str
+    parts = [p for p in parts if isinstance(p, str) and p.strip()]
+    return " | ".join(parts)
 
 
 def load_dataframe(file) -> pd.DataFrame:
