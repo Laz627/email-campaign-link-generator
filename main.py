@@ -9,7 +9,8 @@ from openai import AsyncOpenAI, OpenAIError
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_NAME = "text-embedding-3-small"
+EMBEDDING_MODEL = "text-embedding-3-large"  # Using large model for better accuracy
+EXPLANATION_MODEL = "gpt-4o-mini"  # For generating explanations
 BASE_COLS = ["URL", "Title", "Meta Description", "Top-Level Subfolder"]
 QUERY_COLS = [
     "Query #1",
@@ -142,13 +143,13 @@ async def embed_texts(client: AsyncOpenAI, texts: List[str], parallel: int) -> L
                     if not txt.strip():
                         txt = "Empty content"
                         
-                    r = await client.embeddings.create(model=MODEL_NAME, input=[txt])
+                    r = await client.embeddings.create(model=EMBEDDING_MODEL, input=[txt])
                     return r.data[0].embedding
                 except OpenAIError as e:
                     if attempt == 4:
                         st.error(f"Embedding error after 5 attempts: {str(e)}")
                         # Return a zero embedding as fallback
-                        return [0.0] * 1536  # Standard embedding size
+                        return [0.0] * 3072  # Dimension for large embedding model
                     await asyncio.sleep(2**attempt)
 
     # Use enumerate to track progress
@@ -157,8 +158,48 @@ async def embed_texts(client: AsyncOpenAI, texts: List[str], parallel: int) -> L
     return results
 
 
-def get_cache_key(filename: str, enrich: bool, df_len: int) -> Tuple[str, bool, int]:
-    return (filename, enrich, df_len)
+async def generate_explanations(client: AsyncOpenAI, results_df: pd.DataFrame, topic: str, details: str) -> List[str]:
+    """Generate short explanations for why each URL was selected"""
+    full_topic = f"{topic} {details}".strip()
+    explanations = []
+    
+    async def _get_explanation(row_idx: int):
+        title = results_df.iloc[row_idx]["Title"]
+        description = results_df.iloc[row_idx]["Meta Description"]
+        score = results_df.iloc[row_idx]["similarity"]
+        
+        prompt = f"""Please explain in 1-2 short sentences why this content is relevant to the topic "{full_topic}".
+        
+Content Title: {title}
+Content Description: {description}
+Relevance Score: {score:.2f}
+
+Your explanation should be brief, specific, and highlight the connection between the content and the topic.
+"""
+        
+        for attempt in range(3):
+            try:
+                response = await client.chat.completions.create(
+                    model=EXPLANATION_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=100,
+                    temperature=0.3
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                if attempt == 2:
+                    return f"This content appears relevant to your search for {topic}."
+                await asyncio.sleep(1)
+    
+    # Process explanations in batches to avoid rate limits
+    batch_size = 5
+    for i in range(0, len(results_df), batch_size):
+        batch_indices = range(i, min(i + batch_size, len(results_df)))
+        batch_tasks = [_get_explanation(idx) for idx in batch_indices]
+        batch_results = await asyncio.gather(*batch_tasks)
+        explanations.extend(batch_results)
+        
+    return explanations
 
 
 def boost_exact_match_scores(df: pd.DataFrame, topic: str) -> pd.DataFrame:
@@ -227,14 +268,6 @@ def display_similarity_gauge(score: float) -> None:
         color = colors["low"]
     
     st.progress(gauge_value/100, text=f"Relevance: {gauge_value}%")
-    
-    # Add explanation text
-    if score >= 0.65:
-        st.caption("This content is highly relevant to your topic")
-    elif score >= 0.55:
-        st.caption("This content is strongly related to your topic")
-    else:
-        st.caption("This content has relevant information for your topic")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
@@ -278,6 +311,8 @@ with st.sidebar:
                                help="Considers popular search queries when matching content")
     boost_exact_matches = st.checkbox("Boost exact keyword matches", value=True,
                                   help="Increase scores for content containing your exact keywords")
+    generate_explanations_toggle = st.checkbox("Generate AI explanations", value=True,
+                                          help="Add brief explanations of why content was recommended")
     
     with st.expander("Advanced Settings"):
         concurrency = st.slider("Parallel API requests", 1, 50, 10, 
@@ -386,15 +421,6 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         st.error("No valid content found in the uploaded file.")
         st.stop()
     
-    # Sub‑folder filter
-    folders = df["Top-Level Subfolder"].unique().tolist()
-    chosen_folders = st.multiselect("Filter by category (optional)", folders, default=folders)
-    
-    # Make sure at least one folder is selected
-    if not chosen_folders:
-        st.warning("Please select at least one category to search in.")
-        st.stop()
-    
     with st.status("Finding relevant content...", expanded=True) as status:
         # Compose query
         query_text = f"{topic} {details}".strip()
@@ -405,16 +431,6 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         
         # Create combined field for matching
         df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
-        
-        # Apply folder filter
-        df = df[df["Top-Level Subfolder"].isin(chosen_folders)]
-        original_size = len(df)
-        st.session_state['debug_info'] += f"\nFiltered by folders: {len(df)} rows after folder filtering"
-        
-        if df.empty:
-            status.update(label="No content found in selected categories.", state="error")
-            st.error("No content matched your category filters. Please select different categories.")
-            st.stop()
         
         # Embedding stage
         status.update(label="Creating content embeddings (this may take a moment)...")
@@ -459,6 +475,13 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
                 # Normal case - use filtered results
                 results = filtered_df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
                 st.session_state['debug_info'] += f"\nFinal results: {len(results)} items"
+            
+            # Generate explanations if enabled
+            if generate_explanations_toggle and len(results) > 0:
+                status.update(label="Generating explanations for recommendations...")
+                explanations = asyncio.run(generate_explanations(client, results, topic, details))
+                results["explanation"] = explanations
+                st.session_state['debug_info'] += f"\nGenerated {len(explanations)} recommendation explanations"
             
             status.update(label="✅ Recommendations ready!", state="complete")
             
@@ -523,6 +546,10 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
                             # Display similarity gauge
                             display_similarity_gauge(row["similarity"])
                             
+                            # Show explanation if available
+                            if "explanation" in row and row["explanation"]:
+                                st.markdown(f"**Why this is relevant:** {row['explanation']}")
+                            
                             st.markdown(f"**Description:** {row['Meta Description']}")
                             st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
                             
@@ -540,14 +567,24 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
                             
                             st.divider()
         else:
-            # Single category - show as expandable items
+            # Single category view
             for i, row in display_results.iterrows():
-                with st.expander(f"{row['Title']} - {row['Relevance']} ({row['Score']})", expanded=i==0):
+                with st.container():
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        st.subheader(row["Title"])
+                    with col2:
+                        st.markdown(f"<div style='text-align: right'>{row['Relevance']}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div style='text-align: right'>{row['Score']}</div>", unsafe_allow_html=True)
+                    
                     # Display similarity gauge
                     display_similarity_gauge(row["similarity"])
                     
+                    # Show explanation if available
+                    if "explanation" in row and row["explanation"]:
+                        st.markdown(f"**Why this is relevant:** {row['explanation']}")
+                    
                     st.markdown(f"**Description:** {row['Meta Description']}")
-                    st.markdown(f"**Category:** {row['Top-Level Subfolder']}")
                     st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
                     
                     # Show search queries if available
@@ -559,8 +596,10 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
                             queries.append(f"- {q} ({clicks} clicks)")
                     
                     if queries:
-                        st.markdown("**Popular searches:**")
-                        st.markdown("\n".join(queries))
+                        with st.expander("Popular searches"):
+                            st.markdown("\n".join(queries))
+                    
+                    st.divider()
         
         # Download option
         csv_bytes = results.to_csv(index=False).encode()
