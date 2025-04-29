@@ -1,23 +1,31 @@
 # internal_link_recommender.py
 """
-Smart Internal‑Link Finder
----------------------------------
-Upload a spreadsheet of your site’s pages, paste an e‑mail topic (or any blurb),
-and instantly get the 5‑10 most relevant URLs to link to.  
+Smart Internal‑Link Finder (v2)
+------------------------------
+Upload a spreadsheet of your site’s pages, give the tool **two inputs**:
 
-* Supports CSV **or** XLSX with these columns (case‑sensitive):
-  - URL
-  - Title
-  - Meta Description
-  - Top-Level Subfolder
-  - (optional) Query #1, Query #1 Clicks, Query #2, Query #2 Clicks, Query #3, Query #3 Clicks
-* Uses **text‑embedding‑3‑large** for high‑quality semantic matching
-* Async concurrency slider (1–50) — 10–20 is usually safe under default rate limits
-* Optional checkbox to enrich each page embedding with its top 3 search queries
-* Cosine‑similarity ranking (vectorised NumPy)
-* Download CSV of results
+1. **Core concept / product keyword** (e.g. *"Pella Impervia"*)
+2. **Email blurb / topic** (free‑form)
 
-Run with:  
+…and it returns the 5‑50 most relevant pages to link to, ranked by semantic
+similarity and filtered so that every result actually contains the concept word
+if you want it to.
+
+### What changed in v2
+* Stronger weighting for high‑click queries (1‑‑5 repeats instead of 1‑‑3).
+* **Min‑similarity slider** – hide low‑confidence matches.
+* **Concept filter** – checkbox forces the concept to appear in page text.
+* Separate sidebar fields for *Concept* and *Email blurb* (concatenated for the
+  query embedding), so users don’t forget to include the product keyword.
+
+### Supported columns (case‑sensitive)
+* URL
+* Title
+* Meta Description
+* Top‑Level Subfolder
+* (optional) Query #1/2/3 and their *_Clicks* companions
+
+Run with:
 ```bash
 streamlit run internal_link_recommender.py
 ```
@@ -59,14 +67,26 @@ st.title("🔗 Smart Internal‑Link Finder")
 
 with st.sidebar:
     st.header("⚙️ Settings")
+
+    # API & performance
     api_key = st.text_input("OpenAI API key", type="password")
     concurrency = st.slider("Parallel requests", 1, 50, 10)
+
+    # Query inputs
+    concept = st.text_input("🎯 Core concept / product", help="e.g. ‘Pella Impervia’")
+    blurb = st.text_area("✏️ Email blurb / topic", height=120)
+
+    # Options
     top_n = st.slider("Results to return", 1, 50, 10)
+    min_sim = st.slider("Minimum similarity", 0.0, 1.0, 0.60, step=0.01)
     include_queries = st.checkbox("Add top search queries to embedding", value=True)
+    must_contain_concept = st.checkbox("Only show pages containing concept", value=True)
+
+    # Data upload
     uploaded_file = st.file_uploader(
         "Upload CSV or XLSX of pages", type=["csv", "xlsx"], accept_multiple_files=False
     )
-    query_text = st.text_area("Email topic / blurb", height=120)
+
     run_btn = st.button("🚀 Find links")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -74,10 +94,8 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def combine_fields(row: pd.Series, enrich: bool = True) -> str:
-    """Create the text we send to the embedding model.
-    Cast every element to *str* to avoid TypeErrors when NaN / floats appear.
-    """
-    parts: List[str] = [str(row["URL"]), str(row["Title"]), str(row["Meta Description"])]
+    """Build the text we embed for each page."""
+    parts: List[str] = [str(row["URL"],), str(row["Title"]), str(row["Meta Description"])]
 
     if enrich:
         total_clicks = (
@@ -85,7 +103,6 @@ def combine_fields(row: pd.Series, enrich: bool = True) -> str:
             + row.get("Query #2 Clicks", 0)
             + row.get("Query #3 Clicks", 0)
         ) or 1
-
         for q, c in [
             (row.get("Query #1", ""), row.get("Query #1 Clicks", 0)),
             (row.get("Query #2", ""), row.get("Query #2 Clicks", 0)),
@@ -93,10 +110,9 @@ def combine_fields(row: pd.Series, enrich: bool = True) -> str:
         ]:
             q = "" if (pd.isna(q) or not q) else str(q)
             if q:
-                repeats = 1 + round(2 * c / total_clicks)  # 1–3 repeats
+                repeats = 1 + round(4 * c / total_clicks)  # stronger weighting (1‑5)
                 parts.extend([q] * repeats)
 
-    # keep only non-empty strings, ensure every element is str
     parts = [p for p in parts if isinstance(p, str) and p.strip()]
     return " | ".join(parts)
 
@@ -110,12 +126,10 @@ def load_dataframe(file) -> pd.DataFrame:
     if missing:
         st.error(f"Missing required column(s): {', '.join(missing)}")
         st.stop()
-    # ensure optional query columns exist
     for c in QUERY_COLS:
         if c not in df.columns:
             df[c] = "" if "Clicks" not in c else 0
-    df = df.dropna(subset=BASE_COLS).reset_index(drop=True)
-    return df
+    return df.dropna(subset=BASE_COLS).reset_index(drop=True)
 
 
 def cosine_similarity_matrix(mat: np.ndarray, vec: np.ndarray) -> np.ndarray:
@@ -129,65 +143,76 @@ async def embed_texts(client: AsyncOpenAI, texts: List[str], parallel: int) -> L
         async with sem:
             for attempt in range(5):
                 try:
-                    resp = await client.embeddings.create(model=MODEL_NAME, input=[txt])
-                    return resp.data[0].embedding
+                    r = await client.embeddings.create(model=MODEL_NAME, input=[txt])
+                    return r.data[0].embedding
                 except OpenAIError as e:
                     if attempt == 4:
                         raise e
                     await asyncio.sleep(2 ** attempt)
 
-    tasks = [_embed(t) for t in texts]
-    return await asyncio.gather(*tasks)
+    return await asyncio.gather(*(_embed(t) for t in texts))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main workflow
 # ──────────────────────────────────────────────────────────────────────────────
 if run_btn:
-    if not all([api_key, uploaded_file, query_text.strip()]):
-        st.warning("Please provide an API key, upload a file, and enter a topic.")
+    # Basic validation
+    if not api_key:
+        st.error("Please paste your OpenAI API key.")
         st.stop()
+    if not uploaded_file:
+        st.error("Please upload the pages spreadsheet.")
+        st.stop()
+    if not (concept or blurb):
+        st.error("Enter at least a concept, a blurb, or both.")
+        st.stop()
+
+    # Build composite query text
+    query_text = f"{concept.strip()} {blurb.strip()}".strip()
 
     df = load_dataframe(uploaded_file)
 
-    # optional folder filter after load
+    # Folder filter (optional)
     folders = df["Top-Level Subfolder"].unique().tolist()
-    chosen_folders = st.multiselect(
-        "Restrict to sub‑folders (optional)", options=folders, default=folders
-    )
+    chosen_folders = st.multiselect("Restrict to sub‑folders (optional)", folders, default=folders)
 
     df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
 
-    client = AsyncOpenAI(api_key=api_key)
+    # Apply concept containment filter before ranking if user requests it
+    if concept and must_contain_concept:
+        mask = df["combined"].str.contains(concept, case=False, na=False)
+        df = df[mask]
+        if df.empty:
+            st.warning("No pages contained the concept keyword – showing full set instead.")
+            df = load_dataframe(uploaded_file)  # reset
+            df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
 
-    # cache embeddings per file + settings combo in session_state
+    # (Re)‑embed only if spreadsheet or enrich flag changed
     cache_key = (uploaded_file.name, include_queries)
     if st.session_state.get("embed_cache_key") != cache_key:
-        with st.status("Embedding site pages…"):
-            df_embeddings = asyncio.run(
-                embed_texts(client, df["combined"].tolist(), concurrency)
-            )
-        st.session_state["page_embeddings"] = np.array(df_embeddings, dtype=np.float32)
+        with st.status("Embedding site pages…", expanded=False):
+            client = AsyncOpenAI(api_key=api_key)
+            embeds = asyncio.run(embed_texts(client, df["combined"].tolist(), concurrency))
+        st.session_state["page_embeddings"] = np.array(embeds, dtype=np.float32)
         st.session_state["embed_cache_key"] = cache_key
 
-    page_embeddings = st.session_state["page_embeddings"]
+    embeddings = st.session_state["page_embeddings"]
 
-    # embed query
-    with st.spinner("Embedding your topic…"):
-        query_vec = np.array(
-            asyncio.run(embed_texts(client, [query_text], parallel=1))[0], dtype=np.float32
-        )
+    # Embed the query
+    with st.spinner("Embedding your query…"):
+        client = AsyncOpenAI(api_key=api_key)
+        q_vec = np.array(asyncio.run(embed_texts(client, [query_text], parallel=1))[0], dtype=np.float32)
 
-    # similarity search
-    df["similarity"] = cosine_similarity_matrix(page_embeddings, query_vec)
-    df_filtered = df[df["Top-Level Subfolder"].isin(chosen_folders)]
+    # Similarity & filtering
+    df["similarity"] = cosine_similarity_matrix(embeddings, q_vec)
+    df = df[df["Top-Level Subfolder"].isin(chosen_folders) & (df["similarity"] >= min_sim)]
+
     results = (
-        df_filtered.sort_values("similarity", ascending=False)
-        .head(top_n)
-        .reset_index(drop=True)
+        df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
     )
 
-    # display
+    # Display
     st.subheader("Top Matches")
     st.dataframe(
         results[[
@@ -201,8 +226,8 @@ if run_btn:
         hide_index=True,
     )
 
-    # download csv
+    # Download CSV
     csv_bytes = results.to_csv(index=False).encode()
-    st.download_button("💾 Download CSV", data=csv_bytes, mime="text/csv", file_name="recommended_links.csv")
+    st.download_button("💾 Download CSV", csv_bytes, file_name="recommended_links.csv", mime="text/csv")
 
-    st.success("Done! Relevance ranked by cosine similarity in embedding space.")
+    st.success("Done! Matches filtered by concept, folder, and similarity threshold.")
