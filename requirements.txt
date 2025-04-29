@@ -1,0 +1,4 @@
+streamlit>=1.32            # UI framework
+pandas>=2.2                # data wrangling
+numpy>=1.26                # fast vector maths
+openai>=1.14               # AsyncOpenAI client (text-embedding-3-large)
