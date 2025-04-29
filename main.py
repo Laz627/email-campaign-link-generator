@@ -9,7 +9,7 @@ from openai import AsyncOpenAI, OpenAIError
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_NAME = "text-embedding-3-large"
+MODEL_NAME = "text-embedding-3-small"  # Changed to smaller model - more reliable
 BASE_COLS = ["URL", "Title", "Meta Description", "Top-Level Subfolder"]
 QUERY_COLS = [
     "Query #1",
@@ -26,9 +26,9 @@ QUERY_COLS = [
 
 def combine_fields(row: pd.Series, enrich: bool = True) -> str:
     parts: List[str] = [
-        str(row["URL"]),
         str(row["Title"]),
         str(row["Meta Description"]),
+        str(row["URL"]),
     ]
 
     if enrich:
@@ -53,36 +53,108 @@ def combine_fields(row: pd.Series, enrich: bool = True) -> str:
 
 
 def load_dataframe(file) -> pd.DataFrame:
-    df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
-    missing = [c for c in BASE_COLS if c not in df.columns]
-    if missing:
-        st.error("Missing columns: " + ", ".join(missing))
+    try:
+        df = pd.read_csv(file) if file.name.lower().endswith(".csv") else pd.read_excel(file)
+        
+        # Add debug info
+        st.session_state['debug_info'] = f"Loaded dataframe with {len(df)} rows and {len(df.columns)} columns"
+        
+        # More flexible column checking
+        missing = []
+        for c in BASE_COLS:
+            found = False
+            for col in df.columns:
+                if c.lower() in col.lower():
+                    # Rename to standard name if found with different case/format
+                    if col != c:
+                        df[c] = df[col]
+                    found = True
+                    break
+            if not found:
+                missing.append(c)
+                
+        if missing:
+            st.error(f"Missing columns: {', '.join(missing)}")
+            st.info("Your spreadsheet must contain: URL, Title, Meta Description, and Top-Level Subfolder columns")
+            st.stop()
+            
+        for c in QUERY_COLS:
+            if c not in df.columns:
+                df[c] = 0 if "Clicks" in c else ""
+                
+        # Ensure data types
+        for col in ["Title", "Meta Description", "URL", "Top-Level Subfolder"]:
+            df[col] = df[col].astype(str)
+            
+        # Remove NaN or empty values in critical columns
+        df = df.dropna(subset=BASE_COLS).reset_index(drop=True)
+        
+        # Add debug info
+        st.session_state['debug_info'] += f"\nAfter cleanup: {len(df)} rows remain"
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
         st.stop()
-    for c in QUERY_COLS:
-        if c not in df.columns:
-            df[c] = 0 if "Clicks" in c else ""
-    return df.dropna(subset=BASE_COLS).reset_index(drop=True)
 
 
 def cosine_similarity_matrix(mat: np.ndarray, vec: np.ndarray) -> np.ndarray:
-    return (mat @ vec) / (np.linalg.norm(mat, axis=1) * np.linalg.norm(vec))
+    # Safe version with error handling
+    try:
+        # Check if inputs are valid
+        if len(mat) == 0 or len(vec) == 0:
+            st.error("Empty embeddings detected")
+            return np.zeros(len(mat))
+            
+        # Normalize to prevent division by zero
+        norm_mat = np.linalg.norm(mat, axis=1)
+        norm_vec = np.linalg.norm(vec)
+        
+        # Handle zero norms
+        if norm_vec == 0:
+            return np.zeros(len(mat))
+            
+        zero_norms = norm_mat == 0
+        if np.any(zero_norms):
+            norm_mat[zero_norms] = 1.0  # Prevent division by zero
+            
+        return (mat @ vec) / (norm_mat * norm_vec)
+        
+    except Exception as e:
+        st.error(f"Error calculating similarity: {str(e)}")
+        return np.zeros(len(mat))
 
 
 async def embed_texts(client: AsyncOpenAI, texts: List[str], parallel: int) -> List[List[float]]:
     sem = asyncio.Semaphore(parallel)
+    results = []
 
-    async def _embed(txt: str):
+    async def _embed(txt: str, idx: int):
         async with sem:
             for attempt in range(5):
                 try:
+                    # Add a debug message
+                    if idx % 10 == 0:
+                        st.session_state['embed_status'] = f"Processing item {idx+1}/{len(texts)}"
+                        
+                    # Ensure text isn't empty
+                    if not txt.strip():
+                        txt = "Empty content"
+                        
                     r = await client.embeddings.create(model=MODEL_NAME, input=[txt])
                     return r.data[0].embedding
                 except OpenAIError as e:
                     if attempt == 4:
-                        raise e
+                        st.error(f"Embedding error after 5 attempts: {str(e)}")
+                        # Return a zero embedding as fallback
+                        return [0.0] * 1536  # Standard embedding size
                     await asyncio.sleep(2**attempt)
 
-    return await asyncio.gather(*(_embed(t) for t in texts))
+    # Use enumerate to track progress
+    tasks = [_embed(t, i) for i, t in enumerate(texts)]
+    results = await asyncio.gather(*tasks)
+    return results
 
 
 def get_cache_key(filename: str, enrich: bool, df_len: int) -> Tuple[str, bool, int]:
@@ -90,9 +162,9 @@ def get_cache_key(filename: str, enrich: bool, df_len: int) -> Tuple[str, bool, 
 
 
 def get_relevance_indicator(score: float) -> str:
-    if score >= 0.85:
+    if score >= 0.80:  # Lowered thresholds
         return "🟢 Excellent match"
-    elif score >= 0.75:
+    elif score >= 0.70:
         return "🟡 Good match"
     else:
         return "🟠 Relevant"
@@ -101,6 +173,12 @@ def get_relevance_indicator(score: float) -> str:
 # Streamlit UI
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="📚 Content Recommendation Engine", layout="wide")
+
+# Initialize session state variables if they don't exist
+if 'debug_info' not in st.session_state:
+    st.session_state['debug_info'] = ""
+if 'embed_status' not in st.session_state:
+    st.session_state['embed_status'] = ""
 
 # Header and description
 st.title("📚 Content Recommendation Engine")
@@ -115,7 +193,8 @@ with st.sidebar:
     api_key = st.text_input("OpenAI API key", type="password", help="Required for semantic analysis")
     
     st.subheader("Search Parameters")
-    min_sim = st.slider("Minimum relevance score", 0.0, 1.0, 0.65, 0.01, 
+    # Lowered default threshold to ensure matches
+    min_sim = st.slider("Minimum relevance score", 0.0, 1.0, 0.5, 0.01, 
                       help="Higher = more relevant but potentially fewer results")
     include_queries = st.checkbox("Include search behavior data", value=True, 
                                help="Considers popular search queries when matching content")
@@ -125,6 +204,10 @@ with st.sidebar:
         concurrency = st.slider("Parallel API requests", 1, 50, 10, 
                               help="Higher values may process faster but use more API credits")
         top_n = st.slider("Maximum results to show", 5, 50, 15)
+        
+        # Debug mode toggle
+        debug_mode = st.checkbox("Debug mode", value=False, 
+                              help="Show detailed processing information")
 
 # Main content area
 col1, col2 = st.columns([2, 3])
@@ -190,6 +273,14 @@ with col2:
             }
             st.dataframe(pd.DataFrame(example_data), use_container_width=True)
 
+# Show debug info if enabled
+if 'debug_mode' in locals() and debug_mode and st.session_state['debug_info']:
+    st.sidebar.subheader("Debug Information")
+    st.sidebar.code(st.session_state['debug_info'])
+    
+    if st.session_state['embed_status']:
+        st.sidebar.text(st.session_state['embed_status'])
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main workflow
 # ──────────────────────────────────────────────────────────────────────────────
@@ -199,6 +290,10 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         st.error("⚠️ Please enter your OpenAI API key in the sidebar.")
         st.stop()
     
+    # Reset debug info
+    st.session_state['debug_info'] = ""
+    st.session_state['embed_status'] = ""
+    
     # Display the recommendations section
     st.header(f"📊 Recommendations for: {topic}")
     if details:
@@ -207,15 +302,29 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
     # Read and prep DataFrame
     df = load_dataframe(uploaded_file)
     
+    # Safety check for empty dataframe
+    if len(df) == 0:
+        st.error("No valid content found in the uploaded file.")
+        st.stop()
+    
     # Sub‑folder filter
     folders = df["Top-Level Subfolder"].unique().tolist()
     chosen_folders = st.multiselect("Filter by category (optional)", folders, default=folders)
+    
+    # Make sure at least one folder is selected
+    if not chosen_folders:
+        st.warning("Please select at least one category to search in.")
+        st.stop()
     
     with st.status("Finding relevant content...", expanded=True) as status:
         # Compose query
         query_text = f"{topic} {details}".strip()
         
         status.update(label="Processing content data...")
+        # Add debug info
+        st.session_state['debug_info'] += f"\nProcessing query: '{query_text}'"
+        
+        # Create combined field for matching
         df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
         
         # Topic keyword filter (if enabled)
@@ -224,42 +333,69 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
             mask = df["combined"].str.contains(topic, case=False, na=False)
             df = df[mask]
             filtered_size = len(df)
+            st.session_state['debug_info'] += f"\nFiltered by keyword '{topic}': {filtered_size}/{original_size} rows remain"
+            
             if df.empty:
                 status.update(label="No exact matches found, showing semantic matches instead...")
                 df = load_dataframe(uploaded_file)
                 df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
+                st.session_state['debug_info'] += "\nKeyword filter yielded no results, reverting to full dataset"
             elif filtered_size < original_size:
                 status.update(label=f"Found {filtered_size} pages containing '{topic}'. Analyzing...")
         
+        # Apply folder filter
+        df = df[df["Top-Level Subfolder"].isin(chosen_folders)]
+        st.session_state['debug_info'] += f"\nFiltered by folders: {len(df)}/{original_size} rows remain"
+        
+        if df.empty:
+            status.update(label="No content found in selected categories.", state="error")
+            st.error("No content matched your category filters. Please select different categories.")
+            st.stop()
+        
         # Embedding stage
         status.update(label="Creating content embeddings (this may take a moment)...")
-        cache_key = get_cache_key(uploaded_file.name, include_queries, len(df))
-        if st.session_state.get("embed_cache_key") != cache_key:
-            client = AsyncOpenAI(api_key=api_key)
+        client = AsyncOpenAI(api_key=api_key)
+        
+        # Always regenerate embeddings to ensure they're fresh
+        try:
             vectors = asyncio.run(embed_texts(client, df["combined"].tolist(), concurrency))
-            st.session_state["page_embeddings"] = np.array(vectors, dtype=np.float32)
-            st.session_state["embed_cache_key"] = cache_key
-        
-        embeddings: np.ndarray = st.session_state["page_embeddings"]
-        
-        # Safety check for length mismatch
-        if len(embeddings) != len(df):
-            client = AsyncOpenAI(api_key=api_key)
-            embeddings = np.array(asyncio.run(embed_texts(client, df["combined"].tolist(), concurrency)), dtype=np.float32)
-            st.session_state["page_embeddings"] = embeddings
+            embeddings = np.array(vectors, dtype=np.float32)
+            st.session_state['debug_info'] += f"\nGenerated {len(embeddings)} embeddings"
+        except Exception as e:
+            status.update(label=f"Error generating embeddings: {str(e)}", state="error")
+            st.error(f"Failed to create embeddings: {str(e)}")
+            st.stop()
         
         # Embed query and find matching content
         status.update(label="Finding the best content matches for your topic...")
-        client = AsyncOpenAI(api_key=api_key)
-        q_vec = np.array(asyncio.run(embed_texts(client, [query_text], parallel=1))[0], dtype=np.float32)
-        
-        df["similarity"] = cosine_similarity_matrix(embeddings, q_vec)
-        
-        # Post‑filters
-        df = df[df["Top-Level Subfolder"].isin(chosen_folders) & (df["similarity"] >= min_sim)]
-        
-        results = df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
-        status.update(label="✅ Recommendations ready!", state="complete")
+        try:
+            q_vec = np.array(asyncio.run(embed_texts(client, [query_text], parallel=1))[0], dtype=np.float32)
+            st.session_state['debug_info'] += f"\nGenerated query embedding successfully"
+            
+            # Calculate similarity
+            df["similarity"] = cosine_similarity_matrix(embeddings, q_vec)
+            st.session_state['debug_info'] += f"\nCalculated similarity scores. Range: {df['similarity'].min():.4f} to {df['similarity'].max():.4f}"
+            
+            # Post‑filters
+            filtered_df = df[df["similarity"] >= min_sim]
+            st.session_state['debug_info'] += f"\nAfter similarity threshold ({min_sim}): {len(filtered_df)}/{len(df)} rows remain"
+            
+            if len(filtered_df) == 0:
+                # If no results meet threshold, just take top N
+                status.update(label="No results met similarity threshold, showing best matches instead", state="warning")
+                results = df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
+                st.session_state['debug_info'] += f"\nTaking best {len(results)} results regardless of threshold"
+            else:
+                # Normal case - use filtered results
+                results = filtered_df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
+                st.session_state['debug_info'] += f"\nFinal results: {len(results)} items"
+            
+            status.update(label="✅ Recommendations ready!", state="complete")
+            
+        except Exception as e:
+            status.update(label=f"Error processing recommendations: {str(e)}", state="error")
+            st.error(f"Failed to process recommendations: {str(e)}")
+            st.stop()
     
     # Display results
     if len(results) == 0:
