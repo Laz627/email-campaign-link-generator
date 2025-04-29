@@ -1,20 +1,28 @@
-# streamlit_app.py
+# internal_link_recommender.py
 """
-Self-service internal-link recommender for email campaigns
-=========================================================
-Upload a spreadsheet (CSV or XLSX) containing:
-    • URL
-    • Title
-    • Meta Description
-    • Top-Level Subfolder
+Smart Internal‑Link Finder
+---------------------------------
+Upload a spreadsheet of your site’s pages, paste an e‑mail topic (or any blurb),
+and instantly get the 5‑10 most relevant URLs to link to.  
 
-The app builds OpenAI *text-embedding-3-large* vectors for each row,
-then ranks pages by cosine similarity to a user-supplied topic/e-mail
-snippet.  It supports thousands of pages via asyncio concurrency,
-sub-folder filtering, and one-click CSV download of the top matches.
+* Supports CSV **or** XLSX with these columns (case‑sensitive):
+  - URL
+  - Title
+  - Meta Description
+  - Top-Level Subfolder
+  - (optional) Query #1, Query #1 Clicks, Query #2, Query #2 Clicks, Query #3, Query #3 Clicks
+* Uses **text‑embedding‑3‑large** for high‑quality semantic matching
+* Async concurrency slider (1–50) — 10–20 is usually safe under default rate limits
+* Optional checkbox to enrich each page embedding with its top 3 search queries
+* Cosine‑similarity ranking (vectorised NumPy)
+* Download CSV of results
+
+Run with:  
+```bash
+streamlit run internal_link_recommender.py
+```
 """
 
-import os
 import io
 import asyncio
 from typing import List
@@ -24,180 +32,168 @@ import pandas as pd
 import numpy as np
 from openai import AsyncOpenAI, OpenAIError
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+MODEL_NAME = "text-embedding-3-large"
+BASE_COLS = [
+    "URL",
+    "Title",
+    "Meta Description",
+    "Top-Level Subfolder",
+]
+QUERY_COLS = [
+    "Query #1",
+    "Query #1 Clicks",
+    "Query #2",
+    "Query #2 Clicks",
+    "Query #3",
+    "Query #3 Clicks",
+]
 
-# ──────────────────────────────────────────────────────────────────────────
-# UI – sidebar controls
-# ──────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Internal-Link Recommender", layout="wide")
-
-st.title("🔗 Internal-Link Recommender")
+# ──────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="🔗 Smart Internal‑Link Finder", layout="wide")
+st.title("🔗 Smart Internal‑Link Finder")
 
 with st.sidebar:
-    st.header("🔧 Settings")
-
-    # API key
-    openai_key = st.text_input("🔑 OpenAI API key", type="password")
-
-    # concurrency limit
-    max_concurrency = st.slider(
-        "⏱️ Parallel requests", min_value=1, max_value=50, value=10, step=1
-    )
-
-    # top-N slider (5–10 typical, but make it flexible)
-    top_n = st.slider("🔝 Results to return", min_value=1, max_value=50, value=10)
-
-    st.markdown("---")
+    st.header("⚙️ Settings")
+    api_key = st.text_input("OpenAI API key", type="password")
+    concurrency = st.slider("Parallel requests", 1, 50, 10)
+    top_n = st.slider("Results to return", 1, 50, 10)
+    include_queries = st.checkbox("Add top search queries to embedding", value=True)
     uploaded_file = st.file_uploader(
-        "📄 Upload URL spreadsheet (CSV or XLSX)",
-        type=["csv", "xlsx"],
-        accept_multiple_files=False,
+        "Upload CSV or XLSX of pages", type=["csv", "xlsx"], accept_multiple_files=False
     )
+    query_text = st.text_area("Email topic / blurb", height=120)
+    run_btn = st.button("🚀 Find links")
 
-    # text query for e-mail topic / snippet
-    query_text = st.text_area(
-        "✏️ Paste the e-mail topic / body snippet you’re writing about",
-        height=120,
-    )
+# ──────────────────────────────────────────────────────────────────────────────
+# Helper functions
+# ──────────────────────────────────────────────────────────────────────────────
 
-    run_button = st.button("🚀 Find relevant pages")
+def combine_fields(row: pd.Series, enrich: bool = True) -> str:
+    """Create the text we send to the embedding model."""
+    parts: List[str] = [row["URL"], row["Title"], row["Meta Description"]]
+    if enrich:
+        # optional query weighting proportional to click counts
+        total_clicks = (
+            row.get("Query #1 Clicks", 0) + row.get("Query #2 Clicks", 0) + row.get("Query #3 Clicks", 0)
+        ) or 1
+        for q, c in [
+            (row.get("Query #1", ""), row.get("Query #1 Clicks", 0)),
+            (row.get("Query #2", ""), row.get("Query #2 Clicks", 0)),
+            (row.get("Query #3", ""), row.get("Query #3 Clicks", 0)),
+        ]:
+            if q:
+                repeats = 1 + round(2 * c / total_clicks)  # 1–3 repeats
+                parts.extend([q] * repeats)
+    return " | ".join([p for p in parts if p])
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────
-MODEL_NAME = "text-embedding-3-large"
+def load_dataframe(file) -> pd.DataFrame:
+    if file.name.lower().endswith(".csv"):
+        df = pd.read_csv(file)
+    else:
+        df = pd.read_excel(file)
+    missing = [c for c in BASE_COLS if c not in df.columns]
+    if missing:
+        st.error(f"Missing required column(s): {', '.join(missing)}")
+        st.stop()
+    # ensure optional query columns exist
+    for c in QUERY_COLS:
+        if c not in df.columns:
+            df[c] = "" if "Clicks" not in c else 0
+    df = df.dropna(subset=BASE_COLS).reset_index(drop=True)
+    return df
 
 
-def combine_fields(url: str, title: str, description: str) -> str:
-    """Text fed to the embedding model."""
-    return f"{url.strip()} — {title.strip()} — {description.strip()}"
+def cosine_similarity_matrix(mat: np.ndarray, vec: np.ndarray) -> np.ndarray:
+    return (mat @ vec) / (np.linalg.norm(mat, axis=1) * np.linalg.norm(vec))
 
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+async def embed_texts(client: AsyncOpenAI, texts: List[str], parallel: int) -> List[List[float]]:
+    sem = asyncio.Semaphore(parallel)
 
-
-async def embed_texts(
-    client: AsyncOpenAI, texts: List[str], concurrency: int
-) -> List[List[float]]:
-    """
-    Concurrently embed *texts* with an AsyncOpenAI client, respecting *concurrency*.
-    """
-    semaphore = asyncio.Semaphore(concurrency)
-
-    async def _embed(text: str):
-        async with semaphore:
-            for attempt in range(5):  # simple exponential-backoff retry
+    async def _embed(txt: str):
+        async with sem:
+            for attempt in range(5):
                 try:
-                    resp = await client.embeddings.create(
-                        model=MODEL_NAME, input=[text]
-                    )
+                    resp = await client.embeddings.create(model=MODEL_NAME, input=[txt])
                     return resp.data[0].embedding
                 except OpenAIError as e:
-                    await asyncio.sleep(2**attempt)
-            raise RuntimeError(f"Repeated OpenAI error: {e}")
+                    if attempt == 4:
+                        raise e
+                    await asyncio.sleep(2 ** attempt)
 
     tasks = [_embed(t) for t in texts]
     return await asyncio.gather(*tasks)
 
 
-def prepare_dataframe(file: io.BytesIO | io.StringIO) -> pd.DataFrame:
-    """
-    Load CSV or XLSX and verify mandatory columns.
-    """
-    if file.name.lower().endswith(".csv"):
-        df = pd.read_csv(file)
-    else:
-        df = pd.read_excel(file)
-
-    required_cols = ["URL", "Title", "Meta Description", "Top-Level Subfolder"]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        st.error(f"Missing column(s): {', '.join(missing)}")
-        st.stop()
-
-    # Drop rows with any nulls in critical fields
-    df = df.dropna(subset=required_cols).reset_index(drop=True)
-
-    # Combined text column for embedding
-    df["combined"] = df.apply(
-        lambda r: combine_fields(r["URL"], r["Title"], r["Meta Description"]), axis=1
-    )
-
-    return df
-
-
-# ──────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 # Main workflow
-# ──────────────────────────────────────────────────────────────────────────
-if run_button:
-    if not all([uploaded_file, query_text, openai_key]):
-        st.warning("⬅️ Please provide an API key, a spreadsheet, and a query text.")
+# ──────────────────────────────────────────────────────────────────────────────
+if run_btn:
+    if not all([api_key, uploaded_file, query_text.strip()]):
+        st.warning("Please provide an API key, upload a file, and enter a topic.")
         st.stop()
 
-    df = prepare_dataframe(uploaded_file)
+    df = load_dataframe(uploaded_file)
 
-    # Allow sub-folder filter *after* reading the file
-    subfolders = df["Top-Level Subfolder"].unique().tolist()
+    # optional folder filter after load
+    folders = df["Top-Level Subfolder"].unique().tolist()
     chosen_folders = st.multiselect(
-        "📂 Restrict to sub-folders (optional)",
-        options=subfolders,
-        default=subfolders,
+        "Restrict to sub‑folders (optional)", options=folders, default=folders
     )
 
-    client = AsyncOpenAI(api_key=openai_key)
+    df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
 
-    # ── Embedding – dataset
-    if "page_embeddings" not in st.session_state or st.session_state.get(
-        "source_file"
-    ) != uploaded_file.name:
-        with st.status("Creating embeddings for uploaded pages…", expanded=False):
-            embeddings = asyncio.run(
-                embed_texts(client, df["combined"].tolist(), max_concurrency)
+    client = AsyncOpenAI(api_key=api_key)
+
+    # cache embeddings per file + settings combo in session_state
+    cache_key = (uploaded_file.name, include_queries)
+    if st.session_state.get("embed_cache_key") != cache_key:
+        with st.status("Embedding site pages…"):
+            df_embeddings = asyncio.run(
+                embed_texts(client, df["combined"].tolist(), concurrency)
             )
-        st.session_state["page_embeddings"] = np.array(embeddings, dtype=np.float32)
-        st.session_state["source_file"] = uploaded_file.name
+        st.session_state["page_embeddings"] = np.array(df_embeddings, dtype=np.float32)
+        st.session_state["embed_cache_key"] = cache_key
 
     page_embeddings = st.session_state["page_embeddings"]
 
-    # ── Embedding – query
-    with st.spinner("Embedding your query…"):
-        q_emb = asyncio.run(
-            embed_texts(client, [query_text], concurrency=1)
-        )[0]  # single embedding
+    # embed query
+    with st.spinner("Embedding your topic…"):
+        query_vec = np.array(
+            asyncio.run(embed_texts(client, [query_text], parallel=1))[0], dtype=np.float32
+        )
 
-    q_emb = np.array(q_emb, dtype=np.float32)
-
-    # ── Similarity search
-    df["similarity"] = np.dot(page_embeddings, q_emb) / (
-        np.linalg.norm(page_embeddings, axis=1) * np.linalg.norm(q_emb)
-    )
-
-    # Filter by chosen folders
-    df_filtered = df[df["Top-Level Subfolder"].isin(chosen_folders)].copy()
-
+    # similarity search
+    df["similarity"] = cosine_similarity_matrix(page_embeddings, query_vec)
+    df_filtered = df[df["Top-Level Subfolder"].isin(chosen_folders)]
     results = (
         df_filtered.sort_values("similarity", ascending=False)
         .head(top_n)
         .reset_index(drop=True)
     )
 
-    st.subheader("🎯 Top matches")
+    # display
+    st.subheader("Top Matches")
     st.dataframe(
-        results[
-            ["URL", "Title", "Meta Description", "Top-Level Subfolder", "similarity"]
-        ],
+        results[[
+            "URL",
+            "Title",
+            "Meta Description",
+            "Top-Level Subfolder",
+            "similarity",
+        ]],
         use_container_width=True,
         hide_index=True,
     )
 
-    # Download button
+    # download csv
     csv_bytes = results.to_csv(index=False).encode()
-    st.download_button(
-        label="💾 Download CSV",
-        data=csv_bytes,
-        file_name="recommended_links.csv",
-        mime="text/csv",
-    )
+    st.download_button("💾 Download CSV", data=csv_bytes, mime="text/csv", file_name="recommended_links.csv")
 
-    st.success("Done! (cosine similarity used for ranking.)")
+    st.success("Done! Relevance ranked by cosine similarity in embedding space.")
