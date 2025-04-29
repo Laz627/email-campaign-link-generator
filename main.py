@@ -9,7 +9,7 @@ from openai import AsyncOpenAI, OpenAIError
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-MODEL_NAME = "text-embedding-3-small"  # Changed to smaller model - more reliable
+MODEL_NAME = "text-embedding-3-small"
 BASE_COLS = ["URL", "Title", "Meta Description", "Top-Level Subfolder"]
 QUERY_COLS = [
     "Query #1",
@@ -161,13 +161,80 @@ def get_cache_key(filename: str, enrich: bool, df_len: int) -> Tuple[str, bool, 
     return (filename, enrich, df_len)
 
 
+def boost_exact_match_scores(df: pd.DataFrame, topic: str) -> pd.DataFrame:
+    """Boost similarity scores for content that exactly matches the topic"""
+    if not topic:
+        return df
+        
+    # Check if topic appears in title or description
+    topic_lower = topic.lower()
+    
+    for idx, row in df.iterrows():
+        title_match = topic_lower in row['Title'].lower()
+        desc_match = topic_lower in row['Meta Description'].lower()
+        
+        # Apply boost based on where the match is found
+        if title_match:
+            df.at[idx, 'similarity'] = min(1.0, df.at[idx, 'similarity'] * 1.2)  # 20% boost for title matches
+        elif desc_match:
+            df.at[idx, 'similarity'] = min(1.0, df.at[idx, 'similarity'] * 1.1)  # 10% boost for description matches
+            
+    return df
+
+
 def get_relevance_indicator(score: float) -> str:
-    if score >= 0.80:  # Lowered thresholds
+    """Return a relevance indicator based on similarity score"""
+    # Recalibrated thresholds based on real-world performance
+    if score >= 0.65:
         return "🟢 Excellent match"
-    elif score >= 0.70:
-        return "🟡 Good match"
+    elif score >= 0.55:
+        return "🟡 Strong match"
     else:
-        return "🟠 Relevant"
+        return "🔵 Relevant"
+
+
+def format_score_for_display(score: float) -> str:
+    """Format the similarity score for display, with color coding"""
+    score_pct = int(score * 100)
+    
+    if score >= 0.65:
+        return f"<span style='color:green;font-weight:bold'>{score_pct}%</span>"
+    elif score >= 0.55:
+        return f"<span style='color:#D4AC0D;font-weight:bold'>{score_pct}%</span>"
+    else:
+        return f"<span style='color:blue'>{score_pct}%</span>"
+
+
+def display_similarity_gauge(score: float) -> None:
+    """Display a visual gauge representing similarity strength"""
+    # Calculate value for the gauge (0-100)
+    gauge_value = min(100, max(0, int(score * 100)))
+    
+    # Create a visual representation with custom colors
+    colors = {
+        "poor": "#CDCDCD",
+        "low": "#ADD8E6",
+        "medium": "#D4AC0D",
+        "high": "#5CB85C"
+    }
+    
+    # Determine color based on score
+    if score >= 0.65:
+        color = colors["high"]
+    elif score >= 0.55:
+        color = colors["medium"]
+    else:
+        color = colors["low"]
+    
+    st.progress(gauge_value/100, text=f"Relevance: {gauge_value}%")
+    
+    # Add explanation text
+    if score >= 0.65:
+        st.caption("This content is highly relevant to your topic")
+    elif score >= 0.55:
+        st.caption("This content is strongly related to your topic")
+    else:
+        st.caption("This content has relevant information for your topic")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
@@ -194,11 +261,23 @@ with st.sidebar:
     
     st.subheader("Search Parameters")
     # Lowered default threshold to ensure matches
-    min_sim = st.slider("Minimum relevance score", 0.0, 1.0, 0.5, 0.01, 
+    min_sim = st.slider("Minimum relevance score", 0.0, 1.0, 0.45, 0.01, 
                       help="Higher = more relevant but potentially fewer results")
+    
+    # Explanation of scoring
+    st.info("""
+    **About relevance scores:**
+    - 65%+ = Excellent match 🟢
+    - 55%+ = Strong match 🟡
+    - 45%+ = Relevant 🔵
+    
+    Scores reflect semantic similarity - even "Relevant" content can be quite useful!
+    """)
+    
     include_queries = st.checkbox("Include search behavior data", value=True, 
                                help="Considers popular search queries when matching content")
-    must_contain_topic = st.checkbox("Content must contain topic keyword", value=False)
+    boost_exact_matches = st.checkbox("Boost exact keyword matches", value=True,
+                                  help="Increase scores for content containing your exact keywords")
     
     with st.expander("Advanced Settings"):
         concurrency = st.slider("Parallel API requests", 1, 50, 10, 
@@ -231,7 +310,7 @@ with col1:
         
         st.header("2️⃣ Specify Your Interest")
         topic = st.text_input("What topic are you interested in?", 
-                            placeholder="e.g., sustainable gardening, home renovation")
+                            placeholder="e.g., Pella Impervia, sustainable gardening")
         
         details = st.text_area("Additional details (optional)", 
                              placeholder="Provide more specific information about what you're looking for...",
@@ -327,25 +406,10 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         # Create combined field for matching
         df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
         
-        # Topic keyword filter (if enabled)
-        original_size = len(df)
-        if topic and must_contain_topic:
-            mask = df["combined"].str.contains(topic, case=False, na=False)
-            df = df[mask]
-            filtered_size = len(df)
-            st.session_state['debug_info'] += f"\nFiltered by keyword '{topic}': {filtered_size}/{original_size} rows remain"
-            
-            if df.empty:
-                status.update(label="No exact matches found, showing semantic matches instead...")
-                df = load_dataframe(uploaded_file)
-                df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
-                st.session_state['debug_info'] += "\nKeyword filter yielded no results, reverting to full dataset"
-            elif filtered_size < original_size:
-                status.update(label=f"Found {filtered_size} pages containing '{topic}'. Analyzing...")
-        
         # Apply folder filter
         df = df[df["Top-Level Subfolder"].isin(chosen_folders)]
-        st.session_state['debug_info'] += f"\nFiltered by folders: {len(df)}/{original_size} rows remain"
+        original_size = len(df)
+        st.session_state['debug_info'] += f"\nFiltered by folders: {len(df)} rows after folder filtering"
         
         if df.empty:
             status.update(label="No content found in selected categories.", state="error")
@@ -374,6 +438,12 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
             
             # Calculate similarity
             df["similarity"] = cosine_similarity_matrix(embeddings, q_vec)
+            
+            # Boost exact match scores if enabled
+            if boost_exact_matches:
+                df = boost_exact_match_scores(df, topic)
+                st.session_state['debug_info'] += f"\nBoost applied for exact keyword matches"
+            
             st.session_state['debug_info'] += f"\nCalculated similarity scores. Range: {df['similarity'].min():.4f} to {df['similarity'].max():.4f}"
             
             # Post‑filters
@@ -405,13 +475,28 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         
         # Format for display
         display_results = results.copy()
-        display_results["Score"] = (display_results["similarity"] * 100).round(1).astype(str) + '%'
+        display_results["Score"] = display_results["similarity"].apply(lambda s: format_score_for_display(s))
         display_results["Relevance"] = display_results["similarity"].apply(get_relevance_indicator)
         
         # Results summary table
         st.subheader("Summary")
+        # Use HTML for better formatting
+        st.markdown("""
+        <style>
+        .score-column { text-align: center; }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Display summary dataframe with HTML-formatted scores
         col_order = ["Title", "Top-Level Subfolder", "Score", "Relevance"]
-        st.dataframe(display_results[col_order], use_container_width=True, hide_index=True)
+        st.write(
+            display_results[col_order].to_html(
+                escape=False, 
+                index=False,
+                classes=['dataframe']
+            ), 
+            unsafe_allow_html=True
+        )
         
         # Detailed recommendations
         st.subheader("Detailed Recommendations")
@@ -432,7 +517,11 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
                             with col1:
                                 st.subheader(row["Title"])
                             with col2:
-                                st.markdown(f"<div style='text-align: right'>{row['Relevance']} ({row['Score']})</div>", unsafe_allow_html=True)
+                                st.markdown(f"<div style='text-align: right'>{row['Relevance']}</div>", unsafe_allow_html=True)
+                                st.markdown(f"<div style='text-align: right'>{row['Score']}</div>", unsafe_allow_html=True)
+                            
+                            # Display similarity gauge
+                            display_similarity_gauge(row["similarity"])
                             
                             st.markdown(f"**Description:** {row['Meta Description']}")
                             st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
@@ -454,6 +543,9 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
             # Single category - show as expandable items
             for i, row in display_results.iterrows():
                 with st.expander(f"{row['Title']} - {row['Relevance']} ({row['Score']})", expanded=i==0):
+                    # Display similarity gauge
+                    display_similarity_gauge(row["similarity"])
+                    
                     st.markdown(f"**Description:** {row['Meta Description']}")
                     st.markdown(f"**Category:** {row['Top-Level Subfolder']}")
                     st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
