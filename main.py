@@ -1,6 +1,6 @@
 import asyncio
 import re
-from typing import List, Tuple, Set
+from typing import List, Tuple, Set, Optional
 from collections import Counter
 
 import streamlit as st
@@ -56,6 +56,35 @@ def extract_keywords(text: str) -> Set[str]:
     keywords = {word for word in words if word not in STOP_WORDS and len(word) >= 3}
     
     return keywords
+
+
+def find_traffic_column(df: pd.DataFrame) -> Optional[str]:
+    """Find the most appropriate traffic column in the dataframe"""
+    # Try common traffic column names
+    candidates = [
+        "Monthly Clicks", 
+        "Monthly Traffic", 
+        "Traffic", 
+        "Pageviews", 
+        "Monthly Pageviews",
+        "Visits",
+        "Monthly Visits",
+        "Total Clicks"
+    ]
+    
+    for col in candidates:
+        if col in df.columns:
+            return col
+            
+    # Look for columns with traffic-related terms
+    for col in df.columns:
+        col_lower = col.lower()
+        if any(term in col_lower for term in ["traffic", "click", "visit", "view", "impression"]):
+            # Verify it contains numeric data
+            if pd.api.types.is_numeric_dtype(df[col]) or df[col].astype(str).str.isnumeric().any():
+                return col
+    
+    return None
 
 
 def combine_fields(row: pd.Series, enrich: bool = True) -> str:
@@ -233,6 +262,76 @@ Your explanation should be brief, specific, and highlight the connection between
         explanations.extend(batch_results)
         
     return explanations
+
+
+def boost_by_traffic(df: pd.DataFrame, max_boost: float = 1.25) -> pd.DataFrame:
+    """
+    Boost scores based on page traffic data.
+    
+    Args:
+        df: DataFrame with content items
+        max_boost: Maximum boost factor to apply (1.0 = no boost)
+        
+    Returns:
+        DataFrame with adjusted similarity scores
+    """
+    # Find appropriate traffic column
+    traffic_col = find_traffic_column(df)
+    
+    # If no suitable column found, return unchanged
+    if not traffic_col:
+        if 'debug_info' in st.session_state:
+            st.session_state['debug_info'] += "\nNo traffic column found for boosting"
+        return df
+    
+    # Convert to numeric and handle NaN values
+    df[traffic_col] = pd.to_numeric(df[traffic_col], errors='coerce').fillna(0)
+    
+    # Get non-zero traffic values
+    traffic_values = df[traffic_col][df[traffic_col] > 0]
+    
+    # If no valid traffic data, return unchanged
+    if len(traffic_values) == 0:
+        if 'debug_info' in st.session_state:
+            st.session_state['debug_info'] += f"\nNo valid traffic data in column '{traffic_col}'"
+        return df
+    
+    # Calculate percentiles for normalization (using 95th to handle outliers)
+    p95 = traffic_values.quantile(0.95)
+    p50 = traffic_values.quantile(0.50)
+    
+    # Add debug info
+    if 'debug_info' in st.session_state:
+        st.session_state['debug_info'] += f"\nTraffic stats from '{traffic_col}': median={p50:.1f}, 95th percentile={p95:.1f}"
+    
+    # Apply boost based on traffic
+    boosts_applied = 0
+    
+    for idx, row in df.iterrows():
+        traffic = row.get(traffic_col, 0)
+        if traffic and not pd.isna(traffic) and traffic > 0:
+            # Normalize traffic (0 to 1 scale)
+            norm_traffic = min(traffic, p95) / p95
+            
+            # Calculate boost factor (between 1.0 and max_boost)
+            # Higher boosts for traffic above median
+            if traffic > p50:
+                boost = 1.0 + (max_boost - 1.0) * norm_traffic
+            else:
+                # Smaller boost for below-median traffic
+                boost = 1.0 + (max_boost - 1.0) * norm_traffic * 0.5
+            
+            # Apply boost
+            df.at[idx, 'similarity'] = min(1.0, df.at[idx, 'similarity'] * boost)
+            boosts_applied += 1
+            
+            if 'debug_info' in st.session_state and norm_traffic > 0.5:  # Only log significant boosts
+                st.session_state['debug_info'] += f"\nBoosted item {idx} by {boost:.2f}x based on {traffic} {traffic_col}"
+    
+    if 'debug_info' in st.session_state:
+        st.session_state['debug_info'] += f"\nTraffic boosts applied to {boosts_applied} items"
+    
+    return df
 
 
 def adjust_scores_by_keywords(df: pd.DataFrame, topic: str, demotion_factor: float = 0.8) -> pd.DataFrame:
@@ -447,6 +546,9 @@ with st.sidebar:
     
     boost_by_clicks = st.checkbox("Boost by query relevance & clicks", value=True,
                                help="Increase scores for pages with high-traffic queries related to your topic")
+                               
+    boost_traffic = st.checkbox("Boost high-traffic pages", value=True,
+                             help="Increase scores for pages with high overall traffic")
     
     generate_explanations_toggle = st.checkbox("Generate AI explanations", value=True,
                                           help="Add brief explanations of why content was recommended")
@@ -461,6 +563,9 @@ with st.sidebar:
         
         max_click_boost = st.slider("Maximum click boost", 1.0, 2.0, 1.3, 0.05,
                                   help="Maximum boost factor for high-traffic relevant queries")
+                                  
+        max_traffic_boost = st.slider("Maximum traffic boost", 1.0, 2.0, 1.25, 0.05,
+                                   help="Maximum boost factor for high-traffic pages")
         
         # Debug mode toggle
         debug_mode = st.checkbox("Debug mode", value=False, 
@@ -478,7 +583,9 @@ with col1:
     - **Meta Description**: Brief description
     - **Top-Level Subfolder**: Category or section
     
-    Optional search data columns are also supported.
+    Optional columns that improve recommendations:
+    - Search queries and their clicks
+    - Monthly traffic/pageviews data
     """)
     
     uploaded_file = st.file_uploader("Upload CSV or XLSX", ["csv", "xlsx"])
@@ -515,7 +622,12 @@ with col2:
         
         ### 3. Review Personalized Recommendations
         The AI will analyze your content and find the most relevant pieces based on your 
-        specified topic, ranked by semantic similarity.
+        specified topic, ranked by semantic similarity and enhanced by:
+        
+        - ✓ Semantic relevance to your topic
+        - ✓ Presence of important keywords
+        - ✓ Traffic and engagement data
+        - ✓ Search query relevance
         """)
         
         # Example content format
@@ -526,7 +638,8 @@ with col2:
                 "Meta Description": ["Learn the basics of sustainable gardening", "Cost-effective ways to improve home energy efficiency"],
                 "Top-Level Subfolder": ["Gardening", "Home Improvement"],
                 "Query #1": ["gardening tips", "energy saving"],
-                "Query #1 Clicks": [120, 89]
+                "Query #1 Clicks": [120, 89],
+                "Monthly Traffic": [1450, 980]
             }
             st.dataframe(pd.DataFrame(example_data), use_container_width=True)
 
@@ -575,6 +688,11 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         # Create combined field for matching
         df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
         
+        # Check for traffic column
+        traffic_col = find_traffic_column(df)
+        if traffic_col:
+            st.session_state['debug_info'] += f"\nFound traffic data in column: '{traffic_col}'"
+        
         # Embedding stage
         status.update(label="Creating content embeddings (this may take a moment)...")
         client = AsyncOpenAI(api_key=api_key)
@@ -611,6 +729,10 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
             if boost_by_clicks:
                 df = boost_by_query_clicks(df, topic, max_click_boost)
                 st.session_state['debug_info'] += f"\nBoost applied based on query relevance and clicks"
+                
+            if boost_traffic:
+                df = boost_by_traffic(df, max_traffic_boost)
+                st.session_state['debug_info'] += f"\nBoost applied based on page traffic"
             
             st.session_state['debug_info'] += f"\nFinal similarity scores: range {df['similarity'].min():.4f} to {df['similarity'].max():.4f}"
             
@@ -705,13 +827,17 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
                             st.markdown(f"**Description:** {row['Meta Description']}")
                             st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
                             
+                            # Show traffic if available
+                            if traffic_col and traffic_col in row and row[traffic_col] > 0:
+                                st.markdown(f"**{traffic_col}:** {int(row[traffic_col]):,}")
+                            
                             # Show search queries if available
                             queries = []
                             for q_num in range(1, 4):
                                 q = row.get(f"Query #{q_num}", "")
                                 clicks = row.get(f"Query #{q_num} Clicks", 0)
                                 if q and not pd.isna(q) and clicks > 0:
-                                    queries.append(f"- {q} ({clicks} clicks)")
+                                    queries.append(f"- {q} ({clicks:,} clicks)")
                             
                             if queries:
                                 with st.expander("Popular searches"):
@@ -739,13 +865,17 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
                     st.markdown(f"**Description:** {row['Meta Description']}")
                     st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
                     
+                    # Show traffic if available
+                    if traffic_col and traffic_col in row and row[traffic_col] > 0:
+                        st.markdown(f"**{traffic_col}:** {int(row[traffic_col]):,}")
+                    
                     # Show search queries if available
                     queries = []
                     for q_num in range(1, 4):
                         q = row.get(f"Query #{q_num}", "")
                         clicks = row.get(f"Query #{q_num} Clicks", 0)
                         if q and not pd.isna(q) and clicks > 0:
-                            queries.append(f"- {q} ({clicks} clicks)")
+                            queries.append(f"- {q} ({clicks:,} clicks)")
                     
                     if queries:
                         with st.expander("Popular searches"):
