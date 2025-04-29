@@ -1,19 +1,16 @@
 import asyncio
 from typing import List, Tuple
-import base64
-from io import BytesIO
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from openai import AsyncOpenAI, OpenAIError
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
-EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_MODEL = "text-embedding-3-large"  # Using large model for better accuracy
+EXPLANATION_MODEL = "gpt-4o-mini"  # For generating explanations
 BASE_COLS = ["URL", "Title", "Meta Description", "Top-Level Subfolder"]
 QUERY_COLS = [
     "Query #1",
@@ -161,6 +158,50 @@ async def embed_texts(client: AsyncOpenAI, texts: List[str], parallel: int) -> L
     return results
 
 
+async def generate_explanations(client: AsyncOpenAI, results_df: pd.DataFrame, topic: str, details: str) -> List[str]:
+    """Generate short explanations for why each URL was selected"""
+    full_topic = f"{topic} {details}".strip()
+    explanations = []
+    
+    async def _get_explanation(row_idx: int):
+        title = results_df.iloc[row_idx]["Title"]
+        description = results_df.iloc[row_idx]["Meta Description"]
+        score = results_df.iloc[row_idx]["similarity"]
+        
+        prompt = f"""Please explain in 1-2 short sentences why this content is relevant to the topic "{full_topic}".
+        
+Content Title: {title}
+Content Description: {description}
+Relevance Score: {score:.2f}
+
+Your explanation should be brief, specific, and highlight the connection between the content and the topic.
+"""
+        
+        for attempt in range(3):
+            try:
+                response = await client.chat.completions.create(
+                    model=EXPLANATION_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=100,
+                    temperature=0.3
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                if attempt == 2:
+                    return f"This content appears relevant to your search for {topic}."
+                await asyncio.sleep(1)
+    
+    # Process explanations in batches to avoid rate limits
+    batch_size = 5
+    for i in range(0, len(results_df), batch_size):
+        batch_indices = range(i, min(i + batch_size, len(results_df)))
+        batch_tasks = [_get_explanation(idx) for idx in batch_indices]
+        batch_results = await asyncio.gather(*batch_tasks)
+        explanations.extend(batch_results)
+        
+    return explanations
+
+
 def boost_exact_match_scores(df: pd.DataFrame, topic: str) -> pd.DataFrame:
     """Boost similarity scores for content that exactly matches the topic"""
     if not topic:
@@ -228,102 +269,6 @@ def display_similarity_gauge(score: float) -> None:
     
     st.progress(gauge_value/100, text=f"Relevance: {gauge_value}%")
 
-
-def create_distribution_chart(results_df: pd.DataFrame) -> str:
-    """Create a distribution chart of similarity scores"""
-    plt.figure(figsize=(10, 4))
-    sns.histplot(results_df['similarity'], bins=10, kde=True)
-    plt.title('Distribution of Relevance Scores')
-    plt.xlabel('Relevance Score')
-    plt.ylabel('Count')
-    plt.xlim(0, 1)
-    plt.grid(True, alpha=0.3)
-    
-    # Save to buffer and convert to base64 for embedding
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-    buffer.seek(0)
-    image_base64 = base64.b64encode(buffer.getvalue()).decode()
-    plt.close()
-    
-    return f"data:image/png;base64,{image_base64}"
-
-
-def create_category_chart(results_df: pd.DataFrame) -> str:
-    """Create a chart showing scores by category"""
-    if results_df["Top-Level Subfolder"].nunique() <= 1:
-        return None
-        
-    # Get average similarity by category
-    cat_avg = results_df.groupby("Top-Level Subfolder")["similarity"].mean().reset_index()
-    cat_avg = cat_avg.sort_values("similarity", ascending=False)
-    
-    plt.figure(figsize=(10, 4))
-    bars = plt.barh(cat_avg["Top-Level Subfolder"], cat_avg["similarity"])
-    
-    # Color bars by score
-    for i, bar in enumerate(bars):
-        score = cat_avg["similarity"].iloc[i]
-        if score >= 0.65:
-            bar.set_color("#5CB85C")  # green
-        elif score >= 0.55:
-            bar.set_color("#D4AC0D")  # yellow
-        else:
-            bar.set_color("#ADD8E6")  # blue
-            
-    plt.title('Average Relevance by Category')
-    plt.xlabel('Average Relevance Score')
-    plt.xlim(0, 1)
-    plt.grid(True, alpha=0.3, axis='x')
-    
-    # Save to buffer and convert to base64 for embedding
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
-    buffer.seek(0)
-    image_base64 = base64.b64encode(buffer.getvalue()).decode()
-    plt.close()
-    
-    return f"data:image/png;base64,{image_base64}"
-    
-
-def generate_csv_template() -> BytesIO:
-    """Generate a template CSV file"""
-    template_data = {
-        "URL": ["https://example.com/page1", "https://example.com/page2"],
-        "Title": ["Example Title 1", "Example Title 2"],
-        "Meta Description": ["This is a description for page 1", "This is a description for page 2"],
-        "Top-Level Subfolder": ["Category A", "Category B"],
-        "Query #1": ["search term 1", "search term 3"],
-        "Query #1 Clicks": [100, 150],
-        "Query #2": ["search term 2", "search term 4"],
-        "Query #2 Clicks": [50, 75],
-        "Query #3": ["", "search term 5"],
-        "Query #3 Clicks": [0, 25]
-    }
-    
-    df = pd.DataFrame(template_data)
-    buffer = BytesIO()
-    df.to_csv(buffer, index=False)
-    buffer.seek(0)
-    return buffer
-
-
-def highlight_keyword(text: str, keyword: str) -> str:
-    """Highlight a keyword in text for display"""
-    if not keyword or not text:
-        return text
-        
-    keyword_lower = keyword.lower()
-    if keyword_lower not in text.lower():
-        return text
-        
-    # Find all occurrences (case insensitive)
-    import re
-    pattern = re.compile(re.escape(keyword_lower), re.IGNORECASE)
-    
-    # Replace with highlighted version
-    return pattern.sub(lambda m: f"<mark>{m.group(0)}</mark>", text)
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit UI
 # ──────────────────────────────────────────────────────────────────────────────
@@ -334,25 +279,6 @@ if 'debug_info' not in st.session_state:
     st.session_state['debug_info'] = ""
 if 'embed_status' not in st.session_state:
     st.session_state['embed_status'] = ""
-if 'dark_mode' not in st.session_state:
-    st.session_state['dark_mode'] = False
-
-# Apply dark mode if enabled
-if st.session_state['dark_mode']:
-    st.markdown("""
-    <style>
-    .stApp {
-        background-color: #121212;
-        color: #FFFFFF;
-    }
-    .stMarkdown, .stText, h1, h2, h3, h4, h5, h6, p {
-        color: #FFFFFF !important;
-    }
-    .stDataFrame {
-        background-color: #1E1E1E;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
 # Header and description
 st.title("📚 Content Recommendation Engine")
@@ -385,35 +311,17 @@ with st.sidebar:
                                help="Considers popular search queries when matching content")
     boost_exact_matches = st.checkbox("Boost exact keyword matches", value=True,
                                   help="Increase scores for content containing your exact keywords")
-    highlight_keywords = st.checkbox("Highlight keywords in results", value=True,
-                                 help="Visually highlight your topic in the results")
+    generate_explanations_toggle = st.checkbox("Generate AI explanations", value=True,
+                                          help="Add brief explanations of why content was recommended")
     
     with st.expander("Advanced Settings"):
         concurrency = st.slider("Parallel API requests", 1, 50, 10, 
                               help="Higher values may process faster but use more API credits")
         top_n = st.slider("Maximum results to show", 5, 50, 15)
         
-        show_visualizations = st.checkbox("Show data visualizations", value=True,
-                                      help="Display charts and graphs of the recommendation data")
-                                      
-        # Theme selection
-        dark_mode = st.checkbox("Dark mode", value=st.session_state['dark_mode'])
-        if dark_mode != st.session_state['dark_mode']:
-            st.session_state['dark_mode'] = dark_mode
-            st.rerun()
-        
         # Debug mode toggle
         debug_mode = st.checkbox("Debug mode", value=False, 
                               help="Show detailed processing information")
-                              
-    # Template download
-    st.markdown("### Templates")
-    template_buffer = generate_csv_template()
-    st.download_button("📄 Download CSV Template", 
-                    template_buffer, 
-                    "content_template.csv", 
-                    "text/csv",
-                    help="Download a sample CSV template for your content library")
 
 # Main content area
 col1, col2 = st.columns([2, 3])
@@ -443,14 +351,7 @@ with col1:
                              placeholder="Provide more specific information about what you're looking for...",
                              height=100)
         
-        # Multiple topics mode
-        enable_batch = st.checkbox("Process multiple topics at once", value=False)
-        if enable_batch:
-            topic_list = st.text_area("Enter one topic per line", 
-                                    height=100, 
-                                    help="Each line will be processed as a separate topic")
-        
-        if (topic or (enable_batch and topic_list)):
+        if topic:
             find_btn = st.button("🔍 Find Recommendations", type="primary", use_container_width=True)
         else:
             st.info("Please enter a topic to continue")
@@ -497,59 +398,6 @@ if 'debug_mode' in locals() and debug_mode and st.session_state['debug_info']:
 # ──────────────────────────────────────────────────────────────────────────────
 # Main workflow
 # ──────────────────────────────────────────────────────────────────────────────
-def process_topic(topic_text, details_text, df, client, all_results=None):
-    """Process a single topic and return results"""
-    # Compose query
-    query_text = f"{topic_text} {details_text}".strip()
-    
-    # Add debug info
-    st.session_state['debug_info'] += f"\nProcessing query: '{query_text}'"
-    
-    try:
-        # Create combined field for matching if not already done
-        if "combined" not in df.columns:
-            df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
-        
-        # Get embeddings for query
-        q_vec = np.array(asyncio.run(embed_texts(client, [query_text], parallel=1))[0], dtype=np.float32)
-        st.session_state['debug_info'] += f"\nGenerated query embedding successfully"
-        
-        # Calculate similarity
-        df["similarity"] = cosine_similarity_matrix(embeddings, q_vec)
-        
-        # Boost exact match scores if enabled
-        if boost_exact_matches:
-            df = boost_exact_match_scores(df, topic_text)
-            st.session_state['debug_info'] += f"\nBoost applied for exact keyword matches"
-        
-        st.session_state['debug_info'] += f"\nCalculated similarity scores. Range: {df['similarity'].min():.4f} to {df['similarity'].max():.4f}"
-        
-        # Apply threshold filter
-        filtered_df = df[df["similarity"] >= min_sim]
-        st.session_state['debug_info'] += f"\nAfter similarity threshold ({min_sim}): {len(filtered_df)}/{len(df)} rows remain"
-        
-        if len(filtered_df) == 0:
-            # If no results meet threshold, just take top N
-            results = df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
-            st.session_state['debug_info'] += f"\nTaking best {len(results)} results regardless of threshold"
-        else:
-            # Normal case - use filtered results
-            results = filtered_df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
-            st.session_state['debug_info'] += f"\nFinal results: {len(results)} items"
-        
-        # Add topic info to results
-        results["topic"] = topic_text
-        
-        # Add to all results if in batch mode
-        if all_results is not None:
-            all_results.append(results)
-            
-        return results
-            
-    except Exception as e:
-        st.error(f"Error processing topic '{topic_text}': {str(e)}")
-        return pd.DataFrame()
-
 if uploaded_file and 'find_btn' in locals() and find_btn:
     # Input validation
     if not api_key:
@@ -560,18 +408,10 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
     st.session_state['debug_info'] = ""
     st.session_state['embed_status'] = ""
     
-    # Check if we're in batch mode
-    batch_mode = enable_batch and topic_list and len(topic_list.strip()) > 0
-    
-    if batch_mode:
-        topics = [t.strip() for t in topic_list.splitlines() if t.strip()]
-        st.header(f"📊 Recommendations for {len(topics)} Topics")
-    else:
-        topics = [topic]
-        # Display the recommendations section
-        st.header(f"📊 Recommendations for: {topic}")
-        if details:
-            st.caption(f"Additional context: {details}")
+    # Display the recommendations section
+    st.header(f"📊 Recommendations for: {topic}")
+    if details:
+        st.caption(f"Additional context: {details}")
     
     # Read and prep DataFrame
     df = load_dataframe(uploaded_file)
@@ -582,6 +422,13 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         st.stop()
     
     with st.status("Finding relevant content...", expanded=True) as status:
+        # Compose query
+        query_text = f"{topic} {details}".strip()
+        
+        status.update(label="Processing content data...")
+        # Add debug info
+        st.session_state['debug_info'] += f"\nProcessing query: '{query_text}'"
+        
         # Create combined field for matching
         df["combined"] = df.apply(lambda r: combine_fields(r, include_queries), axis=1)
         
@@ -599,62 +446,60 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
             st.error(f"Failed to create embeddings: {str(e)}")
             st.stop()
         
-        # Process each topic
-        all_results = []
-        
-        if batch_mode:
-            for i, current_topic in enumerate(topics):
-                status.update(label=f"Processing topic {i+1}/{len(topics)}: {current_topic}")
-                process_topic(current_topic, details, df, client, all_results)
-                
-            # Combine all results
-            if all_results:
-                results = pd.concat(all_results, ignore_index=True)
-                status.update(label=f"✅ Found recommendations for {len(topics)} topics!", state="complete")
-            else:
-                status.update(label="No matching content found for any topics", state="error")
-                st.warning("No matching content found. Try broadening your topics or lowering the minimum relevance threshold.")
-                st.stop()
-        else:
-            # Single topic mode
-            status.update(label=f"Finding the best content matches for your topic...")
-            results = process_topic(topic, details, df, client)
+        # Embed query and find matching content
+        status.update(label="Finding the best content matches for your topic...")
+        try:
+            q_vec = np.array(asyncio.run(embed_texts(client, [query_text], parallel=1))[0], dtype=np.float32)
+            st.session_state['debug_info'] += f"\nGenerated query embedding successfully"
             
-            if len(results) > 0:
-                status.update(label="✅ Recommendations ready!", state="complete")
+            # Calculate similarity
+            df["similarity"] = cosine_similarity_matrix(embeddings, q_vec)
+            
+            # Boost exact match scores if enabled
+            if boost_exact_matches:
+                df = boost_exact_match_scores(df, topic)
+                st.session_state['debug_info'] += f"\nBoost applied for exact keyword matches"
+            
+            st.session_state['debug_info'] += f"\nCalculated similarity scores. Range: {df['similarity'].min():.4f} to {df['similarity'].max():.4f}"
+            
+            # Post‑filters
+            filtered_df = df[df["similarity"] >= min_sim]
+            st.session_state['debug_info'] += f"\nAfter similarity threshold ({min_sim}): {len(filtered_df)}/{len(df)} rows remain"
+            
+            if len(filtered_df) == 0:
+                # If no results meet threshold, just take top N
+                status.update(label="No results met similarity threshold, showing best matches instead", state="warning")
+                results = df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
+                st.session_state['debug_info'] += f"\nTaking best {len(results)} results regardless of threshold"
             else:
-                status.update(label="No matching content found", state="error")
-                st.warning("No matching content found. Try broadening your topic or lowering the minimum relevance threshold.")
-                st.stop()
+                # Normal case - use filtered results
+                results = filtered_df.sort_values("similarity", ascending=False).head(top_n).reset_index(drop=True)
+                st.session_state['debug_info'] += f"\nFinal results: {len(results)} items"
+            
+            # Generate explanations if enabled
+            if generate_explanations_toggle and len(results) > 0:
+                status.update(label="Generating explanations for recommendations...")
+                explanations = asyncio.run(generate_explanations(client, results, topic, details))
+                results["explanation"] = explanations
+                st.session_state['debug_info'] += f"\nGenerated {len(explanations)} recommendation explanations"
+            
+            status.update(label="✅ Recommendations ready!", state="complete")
+            
+        except Exception as e:
+            status.update(label=f"Error processing recommendations: {str(e)}", state="error")
+            st.error(f"Failed to process recommendations: {str(e)}")
+            st.stop()
     
     # Display results
     if len(results) == 0:
         st.warning("No matching content found. Try broadening your topic or lowering the minimum relevance threshold.")
     else:
-        if batch_mode:
-            st.success(f"Found recommendations for {len(topics)} topics!")
-        else:
-            st.success(f"Found {len(results)} recommendations related to your topic!")
+        st.success(f"Found {len(results)} recommendations related to your topic!")
         
         # Format for display
         display_results = results.copy()
         display_results["Score"] = display_results["similarity"].apply(lambda s: format_score_for_display(s))
         display_results["Relevance"] = display_results["similarity"].apply(get_relevance_indicator)
-        
-        # Data Visualizations
-        if show_visualizations and not batch_mode:
-            st.subheader("Visualization")
-            viz_col1, viz_col2 = st.columns(2)
-            
-            with viz_col1:
-                dist_chart = create_distribution_chart(results)
-                st.markdown(f"<img src='{dist_chart}' width='100%'>", unsafe_allow_html=True)
-                
-            with viz_col2:
-                if results["Top-Level Subfolder"].nunique() > 1:
-                    cat_chart = create_category_chart(results)
-                    if cat_chart:
-                        st.markdown(f"<img src='{cat_chart}' width='100%'>", unsafe_allow_html=True)
         
         # Results summary table
         st.subheader("Summary")
@@ -666,11 +511,7 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         """, unsafe_allow_html=True)
         
         # Display summary dataframe with HTML-formatted scores
-        if batch_mode:
-            col_order = ["topic", "Title", "Top-Level Subfolder", "Score", "Relevance"]
-        else:
-            col_order = ["Title", "Top-Level Subfolder", "Score", "Relevance"]
-            
+        col_order = ["Title", "Top-Level Subfolder", "Score", "Relevance"]
         st.write(
             display_results[col_order].to_html(
                 escape=False, 
@@ -683,142 +524,83 @@ if uploaded_file and 'find_btn' in locals() and find_btn:
         # Detailed recommendations
         st.subheader("Detailed Recommendations")
         
-        # If batch mode, create tabs for each topic
-        if batch_mode:
-            topic_tabs = st.tabs(topics)
+        # Determine if we should group by category
+        if display_results["Top-Level Subfolder"].nunique() > 1:
+            # Show tabs for each category
+            tabs = st.tabs([f"{cat} ({len(display_results[display_results['Top-Level Subfolder']==cat])})" 
+                           for cat in sorted(display_results["Top-Level Subfolder"].unique())])
             
-            for i, current_topic in enumerate(topics):
-                with topic_tabs[i]:
-                    topic_results = display_results[display_results["topic"] == current_topic]
+            for i, category in enumerate(sorted(display_results["Top-Level Subfolder"].unique())):
+                with tabs[i]:
+                    category_results = display_results[display_results["Top-Level Subfolder"] == category]
                     
-                    if len(topic_results) == 0:
-                        st.info(f"No matches found for '{current_topic}'")
-                        continue
-                        
-                    # Determine if we should group by category for this topic
-                    if topic_results["Top-Level Subfolder"].nunique() > 1:
-                        # Show tabs for each category
-                        cats = sorted(topic_results["Top-Level Subfolder"].unique())
-                        cat_tabs = st.tabs([f"{cat} ({len(topic_results[topic_results['Top-Level Subfolder']==cat])})" 
-                                        for cat in cats])
-                        
-                        for j, category in enumerate(cats):
-                            with cat_tabs[j]:
-                                cat_results = topic_results[topic_results["Top-Level Subfolder"] == category]
-                                
-                                for _, row in cat_results.iterrows():
-                                    display_result_item(row, current_topic if highlight_keywords else None)
-                    else:
-                        # Single category for this topic
-                        for _, row in topic_results.iterrows():
-                            display_result_item(row, current_topic if highlight_keywords else None)
+                    for _, row in category_results.iterrows():
+                        with st.container():
+                            col1, col2 = st.columns([4, 1])
+                            with col1:
+                                st.subheader(row["Title"])
+                            with col2:
+                                st.markdown(f"<div style='text-align: right'>{row['Relevance']}</div>", unsafe_allow_html=True)
+                                st.markdown(f"<div style='text-align: right'>{row['Score']}</div>", unsafe_allow_html=True)
+                            
+                            # Display similarity gauge
+                            display_similarity_gauge(row["similarity"])
+                            
+                            # Show explanation if available
+                            if "explanation" in row and row["explanation"]:
+                                st.markdown(f"**Why this is relevant:** {row['explanation']}")
+                            
+                            st.markdown(f"**Description:** {row['Meta Description']}")
+                            st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
+                            
+                            # Show search queries if available
+                            queries = []
+                            for q_num in range(1, 4):
+                                q = row.get(f"Query #{q_num}", "")
+                                clicks = row.get(f"Query #{q_num} Clicks", 0)
+                                if q and not pd.isna(q) and clicks > 0:
+                                    queries.append(f"- {q} ({clicks} clicks)")
+                            
+                            if queries:
+                                with st.expander("Popular searches"):
+                                    st.markdown("\n".join(queries))
+                            
+                            st.divider()
         else:
-            # Single topic mode - group by category if needed
-            if display_results["Top-Level Subfolder"].nunique() > 1:
-                # Show tabs for each category
-                cats = sorted(display_results["Top-Level Subfolder"].unique())
-                cat_tabs = st.tabs([f"{cat} ({len(display_results[display_results['Top-Level Subfolder']==cat])})" 
-                                   for cat in cats])
-                
-                for j, category in enumerate(cats):
-                    with cat_tabs[j]:
-                        cat_results = display_results[display_results["Top-Level Subfolder"] == category]
-                        
-                        for _, row in cat_results.iterrows():
-                            display_result_item(row, topic if highlight_keywords else None)
-            else:
-                # Single category
-                for _, row in display_results.iterrows():
-                    display_result_item(row, topic if highlight_keywords else None)
+            # Single category view
+            for i, row in display_results.iterrows():
+                with st.container():
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        st.subheader(row["Title"])
+                    with col2:
+                        st.markdown(f"<div style='text-align: right'>{row['Relevance']}</div>", unsafe_allow_html=True)
+                        st.markdown(f"<div style='text-align: right'>{row['Score']}</div>", unsafe_allow_html=True)
+                    
+                    # Display similarity gauge
+                    display_similarity_gauge(row["similarity"])
+                    
+                    # Show explanation if available
+                    if "explanation" in row and row["explanation"]:
+                        st.markdown(f"**Why this is relevant:** {row['explanation']}")
+                    
+                    st.markdown(f"**Description:** {row['Meta Description']}")
+                    st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
+                    
+                    # Show search queries if available
+                    queries = []
+                    for q_num in range(1, 4):
+                        q = row.get(f"Query #{q_num}", "")
+                        clicks = row.get(f"Query #{q_num} Clicks", 0)
+                        if q and not pd.isna(q) and clicks > 0:
+                            queries.append(f"- {q} ({clicks} clicks)")
+                    
+                    if queries:
+                        with st.expander("Popular searches"):
+                            st.markdown("\n".join(queries))
+                    
+                    st.divider()
         
-        # Download options
-        st.subheader("Export Results")
-        export_col1, export_col2, export_col3 = st.columns(3)
-        
-        with export_col1:
-            csv_bytes = results.to_csv(index=False).encode()
-            st.download_button("💾 Download CSV", 
-                            csv_bytes, 
-                            "content_recommendations.csv", 
-                            "text/csv")
-                            
-        with export_col2:
-            excel_buffer = BytesIO()
-            results.to_excel(excel_buffer, index=False)
-            excel_buffer.seek(0)
-            st.download_button("📊 Download Excel", 
-                            excel_buffer, 
-                            "content_recommendations.xlsx", 
-                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                            
-        with export_col3:
-            # Generate HTML report
-            html_buffer = BytesIO()
-            html_content = f"""
-            <html>
-            <head>
-                <title>Content Recommendations for {topic}</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; margin: 20px; }}
-                    h1 {{ color: #2C3E50; }}
-                    .score-high {{ color: green; font-weight: bold; }}
-                    .score-medium {{ color: #D4AC0D; font-weight: bold; }}
-                    .score-low {{ color: blue; }}
-                    table {{ border-collapse: collapse; width: 100%; }}
-                    th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
-                    th {{ background-color: #f2f2f2; }}
-                </style>
-            </head>
-            <body>
-                <h1>Content Recommendations</h1>
-                <p>Report generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')}</p>
-                <h2>Summary</h2>
-                {results.to_html(index=False)}
-            </body>
-            </html>
-            """
-            html_buffer.write(html_content.encode())
-            html_buffer.seek(0)
-            
-            st.download_button("📄 Download HTML Report", 
-                            html_buffer, 
-                            "content_recommendations.html", 
-                            "text/html")
-
-# Define the result item display function
-def display_result_item(row, highlight_topic=None):
-    with st.container():
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            title_text = row["Title"]
-            if highlight_topic and highlight_keywords:
-                title_text = highlight_keyword(title_text, highlight_topic)
-            st.markdown(f"### {title_text}", unsafe_allow_html=True)
-        with col2:
-            st.markdown(f"<div style='text-align: right'>{row['Relevance']}</div>", unsafe_allow_html=True)
-            st.markdown(f"<div style='text-align: right'>{row['Score']}</div>", unsafe_allow_html=True)
-        
-        # Display similarity gauge
-        display_similarity_gauge(row["similarity"])
-        
-        # Display highlighted content if enabled
-        desc_text = row["Meta Description"]
-        if highlight_topic and highlight_keywords:
-            desc_text = highlight_keyword(desc_text, highlight_topic)
-            
-        st.markdown(f"**Description:** {desc_text}", unsafe_allow_html=True)
-        st.markdown(f"**Link:** [{row['URL']}]({row['URL']})")
-        
-        # Show search queries if available
-        queries = []
-        for q_num in range(1, 4):
-            q = row.get(f"Query #{q_num}", "")
-            clicks = row.get(f"Query #{q_num} Clicks", 0)
-            if q and not pd.isna(q) and clicks > 0:
-                queries.append(f"- {q} ({clicks} clicks)")
-        
-        if queries:
-            with st.expander("Popular searches"):
-                st.markdown("\n".join(queries))
-        
-        st.divider()
+        # Download option
+        csv_bytes = results.to_csv(index=False).encode()
+        st.download_button("💾 Download Recommendations", csv_bytes, "content_recommendations.csv", "text/csv")
